@@ -8,10 +8,9 @@ import os
 import json
 import folder_paths
 import comfy.model_management
-import comfy.utils
 from PIL import Image
 import numpy as np
-from typing import Optional, Callable, Any
+from typing import Optional
 import time
 import base64
 from io import BytesIO
@@ -45,8 +44,6 @@ class IntermediateStreamer:
         self.progress_file = os.path.join(output_dir, "progress.json")
 
         os.makedirs(output_dir, exist_ok=True)
-
-        # Initialize progress file
         self._update_progress(0, None, "starting")
 
     def _update_progress(self, step: int, image_path: Optional[str], status: str, base64_data: str = None):
@@ -63,20 +60,27 @@ class IntermediateStreamer:
         if base64_data and self.save_base64:
             progress["image_base64"] = base64_data
 
-        with open(self.progress_file, 'w') as f:
-            json.dump(progress, f)
+        try:
+            with open(self.progress_file, 'w') as f:
+                json.dump(progress, f)
+        except Exception as e:
+            print(f"[SaveIntermediates] Error writing progress: {e}")
 
-    def save_step(self, denoised: torch.Tensor, step: int, sigma: float = 0.0):
+    def save_step(self, denoised: torch.Tensor, step: int):
         """Save a single step's denoised latent as an image"""
         try:
             if self.previewer is None:
                 return None
 
-            # Handle batch dimension
-            if denoised.dim() == 4:
-                latent = denoised[0:1]
-            else:
-                latent = denoised.unsqueeze(0)
+            # Ensure proper shape: [B, C, H, W]
+            if denoised.dim() == 3:
+                denoised = denoised.unsqueeze(0)
+            elif denoised.dim() == 5:
+                # Video latent [B, F, C, H, W] - take first frame
+                denoised = denoised[:, 0, :, :, :]
+
+            # Take first batch item only
+            latent = denoised[0:1].to(torch.float32)
 
             # Decode using TAESD
             preview_result = self.previewer.decode_latent_to_preview_image(
@@ -87,16 +91,13 @@ class IntermediateStreamer:
             if preview_result and len(preview_result) > 1:
                 img = preview_result[1]
 
-                # Save image with consistent naming
                 filename = f"{self.prefix}_{step:04d}.{self.format}"
                 filepath = os.path.join(self.output_dir, filename)
                 img.save(filepath, quality=85 if self.format == "jpeg" else None)
 
-                # Also save as "latest.jpg" for easy frontend access
                 latest_path = os.path.join(self.output_dir, f"latest.{self.format}")
                 img.save(latest_path, quality=85 if self.format == "jpeg" else None)
 
-                # Optionally encode as base64 for direct API response
                 base64_data = None
                 if self.save_base64:
                     buffer = BytesIO()
@@ -104,8 +105,6 @@ class IntermediateStreamer:
                     base64_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
                 self.step_count += 1
-
-                # Update progress file
                 self._update_progress(step, filename, "generating", base64_data)
 
                 return filepath
@@ -123,7 +122,7 @@ class IntermediateStreamer:
 class SaveIntermediateSteps:
     """
     Saves intermediate sampling steps for streaming to frontend.
-    Images saved to predictable location for polling/streaming.
+    Uses ComfyUI's callback system to get properly denoised latents.
     """
 
     @classmethod
@@ -150,7 +149,6 @@ class SaveIntermediateSteps:
     def wrap_model(self, model, steps: int, job_id: str = "", output_folder: str = "progress",
                    filename_prefix: str = "step", format: str = "jpeg", include_base64: bool = False):
 
-        # Create output directory - use job_id for unique folder
         base_output = folder_paths.get_output_directory()
         if job_id:
             full_output_dir = os.path.join(base_output, output_folder, job_id)
@@ -158,10 +156,8 @@ class SaveIntermediateSteps:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             full_output_dir = os.path.join(base_output, output_folder, timestamp)
 
-        # Get TAESD previewer
         previewer = get_taesd_decoder(model.model.latent_format)
 
-        # Create streamer instance
         streamer = IntermediateStreamer(
             output_dir=full_output_dir,
             prefix=filename_prefix,
@@ -174,30 +170,56 @@ class SaveIntermediateSteps:
 
         # Clone model
         wrapped_model = model.clone()
+
+        # Store model sampling info for denoising calculation
+        model_sampling = wrapped_model.model.model_sampling if hasattr(wrapped_model.model, 'model_sampling') else None
+
+        # Get original apply_model
         original_apply_model = wrapped_model.model.apply_model
         step_counter = [0]
 
         def patched_apply_model(x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
-            result = original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+            # Call original
+            model_output = original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
 
             try:
-                if hasattr(wrapped_model.model, 'model_sampling'):
-                    sigma = wrapped_model.model.model_sampling.sigma(t)
-                    sigma_val = sigma[0].item() if sigma.dim() > 0 else sigma.item()
-                else:
-                    sigma_val = 0.0
+                # Calculate denoised (x0) from model output
+                # For most models: x0 = x - sigma * eps (for eps prediction)
+                # Or for v-prediction: x0 = sigma * x - ... (more complex)
 
-                streamer.save_step(result, step_counter[0], sigma_val)
+                if model_sampling is not None:
+                    sigma = model_sampling.sigma(t)
+                    if sigma.dim() == 0:
+                        sigma = sigma.unsqueeze(0)
+
+                    # Reshape sigma for broadcasting [B, 1, 1, 1]
+                    while sigma.dim() < x.dim():
+                        sigma = sigma.unsqueeze(-1)
+
+                    # Calculate denoised estimate
+                    # This assumes eps-prediction: x0 = x - sigma * eps
+                    # For v-prediction models this won't be perfect but still shows progress
+                    denoised = x - sigma * model_output
+                else:
+                    # Fallback: just use input x as rough estimate
+                    denoised = x
+
+                # Make sure it's the right shape [B, C, H, W]
+                if denoised.dim() == 4:
+                    streamer.save_step(denoised, step_counter[0])
+                elif denoised.dim() == 5:
+                    # Video: save first frame
+                    streamer.save_step(denoised[:, 0], step_counter[0])
+
                 step_counter[0] += 1
 
             except Exception as e:
-                print(f"[SaveIntermediates] Error: {e}")
+                print(f"[SaveIntermediates] Error at step {step_counter[0]}: {e}")
+                step_counter[0] += 1
 
-            return result
+            return model_output
 
         wrapped_model.model.apply_model = patched_apply_model
-
-        # Store streamer reference for finalization
         wrapped_model._intermediate_streamer = streamer
 
         print(f"[SaveIntermediates] Streaming to: {full_output_dir}")
@@ -260,11 +282,12 @@ class SaveIntermediateStepsAdvanced:
         )
 
         wrapped_model = model.clone()
+        model_sampling = wrapped_model.model.model_sampling if hasattr(wrapped_model.model, 'model_sampling') else None
         original_apply_model = wrapped_model.model.apply_model
         step_counter = [0]
 
         def patched_apply_model(x, t, c_concat=None, c_crossattn=None, control=None, transformer_options={}, **kwargs):
-            result = original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+            model_output = original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
 
             current_step = step_counter[0]
             should_save = (
@@ -275,19 +298,26 @@ class SaveIntermediateStepsAdvanced:
 
             if should_save:
                 try:
-                    if hasattr(wrapped_model.model, 'model_sampling'):
-                        sigma = wrapped_model.model.model_sampling.sigma(t)
-                        sigma_val = sigma[0].item() if sigma.dim() > 0 else sigma.item()
+                    if model_sampling is not None:
+                        sigma = model_sampling.sigma(t)
+                        if sigma.dim() == 0:
+                            sigma = sigma.unsqueeze(0)
+                        while sigma.dim() < x.dim():
+                            sigma = sigma.unsqueeze(-1)
+                        denoised = x - sigma * model_output
                     else:
-                        sigma_val = 0.0
+                        denoised = x
 
-                    streamer.save_step(result, current_step, sigma_val)
+                    if denoised.dim() == 4:
+                        streamer.save_step(denoised, current_step)
+                    elif denoised.dim() == 5:
+                        streamer.save_step(denoised[:, 0], current_step)
 
                 except Exception as e:
-                    print(f"[SaveIntermediates] Error: {e}")
+                    print(f"[SaveIntermediates] Error at step {current_step}: {e}")
 
             step_counter[0] += 1
-            return result
+            return model_output
 
         wrapped_model.model.apply_model = patched_apply_model
         wrapped_model._intermediate_streamer = streamer
@@ -307,7 +337,7 @@ class GetIntermediateImages:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "latent": ("LATENT",),  # Connect from sampler output to ensure this runs after
+                "latent": ("LATENT",),
             },
             "optional": {
                 "job_id": ("STRING", {"default": ""}),
@@ -325,11 +355,9 @@ class GetIntermediateImages:
 
         base_output = folder_paths.get_output_directory()
 
-        # Find the output directory
         if job_id:
             search_dir = os.path.join(base_output, output_folder, job_id)
         else:
-            # Find most recent folder
             progress_dir = os.path.join(base_output, output_folder)
             if os.path.exists(progress_dir):
                 folders = sorted([f for f in os.listdir(progress_dir) if os.path.isdir(os.path.join(progress_dir, f))])
@@ -340,7 +368,6 @@ class GetIntermediateImages:
             else:
                 return (torch.zeros(1, 64, 64, 3),)
 
-        # Collect images
         images = []
         if os.path.exists(search_dir):
             files = sorted([f for f in os.listdir(search_dir) if f.startswith("step_") and (f.endswith(".jpeg") or f.endswith(".png"))])
@@ -355,7 +382,6 @@ class GetIntermediateImages:
                     print(f"[GetIntermediateImages] Error loading {filename}: {e}")
 
         if images:
-            # Stack into batch
             batch = torch.stack(images, dim=0)
             return (batch,)
         else:

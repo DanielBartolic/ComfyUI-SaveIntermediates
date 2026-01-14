@@ -1,6 +1,6 @@
 # ComfyUI-SaveIntermediates
 
-Save intermediate sampling steps as images during diffusion. Works with any sampler including ClownSampler, KSampler, etc.
+Save and stream intermediate sampling steps during diffusion. Perfect for showing generation progress on your frontend instead of a loading spinner.
 
 ## Installation
 
@@ -11,65 +11,110 @@ git clone https://github.com/DanielBartolic/ComfyUI-SaveIntermediates.git
 
 ## Usage
 
-### Basic Usage
+### For Serverless/API Streaming
 
-Connect the **Save Intermediate Steps** node between your model loader and sampler:
+Connect the node between your model loader and sampler:
 
 ```
-Load Checkpoint → [Save Intermediate Steps] → ClownSampler → VAE Decode → Save Image
+Load Checkpoint → [Save Intermediate Steps] → ClownSampler → ...
+                         ↓
+                   (outputs to progress folder)
 ```
 
-### Nodes
+Your frontend can poll `progress.json` to get:
+- Current step / total steps
+- Progress percentage
+- Path to latest image
+- Optional base64 encoded image
 
-#### Save Intermediate Steps
-Basic node that saves every step.
+### Workflow with Image Output
+
+```
+Load Checkpoint → [Save Intermediate Steps] → ClownSampler → [Get Intermediate Images] → Preview/Save
+                                                    ↓
+                                              (latent output)
+```
+
+## Nodes
+
+### Save Intermediate Steps
+Wraps model and saves TAESD previews at each step.
 
 **Inputs:**
-- `model` - Connect from your model loader
-- `output_folder` - Subfolder name in ComfyUI output directory (default: "intermediates")
-- `filename_prefix` - Prefix for saved files (default: "step")
-- `format` - Image format: jpeg or png
-- `save_latents` - Also save raw latent tensors (.pt files)
+- `model` - From your model loader
+- `steps` - Total sampling steps (for progress calculation)
+- `job_id` - Unique ID for this job (creates subfolder)
+- `output_folder` - Base folder name (default: "progress")
+- `filename_prefix` - Prefix for files (default: "step")
+- `format` - jpeg or png
+- `include_base64` - Include base64 in progress.json
 
 **Output:**
-- `model` - Pass-through to your sampler
+- `model` - Pass to your sampler
 
-#### Save Intermediate Steps (Advanced)
-More control over which steps to save.
+### Save Intermediate Steps (Advanced)
+Same as above with filtering options:
+- `save_every_n` - Save every Nth step
+- `start_step` / `end_step` - Range of steps to save
 
-**Additional Inputs:**
-- `save_every_n` - Save every Nth step (default: 1 = all steps)
-- `start_step` - First step to save (default: 0)
-- `end_step` - Last step to save (default: 999)
+### Get Intermediate Images
+Collects all saved intermediates as IMAGE batch after sampling.
 
-## Output
+**Inputs:**
+- `latent` - Connect from sampler (ensures this runs after)
+- `job_id` - Match the job_id used in Save node
+- `output_folder` - Match the folder used
 
-Images are saved to:
+**Output:**
+- `images` - Batch of all intermediate images
+
+## Output Structure
+
 ```
-ComfyUI/output/intermediates/YYYYMMDD_HHMMSS/
+ComfyUI/output/progress/{job_id}/
+├── progress.json      # Poll this for status
+├── latest.jpeg        # Always the most recent step
 ├── step_0000.jpeg
 ├── step_0001.jpeg
 ├── step_0002.jpeg
 ...
-└── latents/  (if save_latents enabled)
-    ├── step_0000.pt
-    └── ...
 ```
 
-## How It Works
+### progress.json Format
 
-The node wraps your model and intercepts each call to `apply_model()` during sampling. It uses TAESD (Tiny AutoEncoder for Stable Diffusion) to quickly decode latents to preview images - the same method ComfyUI uses for live previews.
+```json
+{
+  "job_id": "abc123",
+  "status": "generating",
+  "current_step": 15,
+  "total_steps": 20,
+  "progress_percent": 75,
+  "latest_image": "step_0015.jpeg",
+  "timestamp": 1704567890.123,
+  "image_base64": "..."  // if include_base64 enabled
+}
+```
 
-This means:
-- Fast decoding (TAESD, not full VAE)
-- Minimal overhead
-- Works with any sampler
-- No modification to samplers needed
+## Frontend Integration Example
 
-## Requirements
+```javascript
+// Poll for progress
+async function pollProgress(jobId) {
+  const response = await fetch(`/output/progress/${jobId}/progress.json`);
+  const data = await response.json();
 
-- ComfyUI with TAESD models installed (usually automatic)
-- Works with SD1.5, SDXL, SD3.5, Flux, etc.
+  if (data.status === 'generating') {
+    // Show preview image
+    const imgUrl = `/output/progress/${jobId}/${data.latest_image}`;
+    updatePreview(imgUrl);
+    updateProgressBar(data.progress_percent);
+  }
+
+  if (data.status !== 'completed') {
+    setTimeout(() => pollProgress(jobId), 500);
+  }
+}
+```
 
 ## License
 

@@ -1,6 +1,6 @@
 """
 Save Intermediate Steps Node
-Saves TAESD preview images at each sampling step for streaming to frontend
+Saves preview images at each sampling step for streaming to frontend
 """
 
 import torch
@@ -16,15 +16,16 @@ import base64
 from io import BytesIO
 
 
-def get_taesd_decoder(latent_format):
-    """Get TAESD decoder for fast latent-to-image conversion"""
+def get_previewer(model):
+    """Get previewer for latent-to-image conversion"""
     try:
         import latent_preview
         device = comfy.model_management.get_torch_device()
+        latent_format = model.model.latent_format
         previewer = latent_preview.get_previewer(device, latent_format)
         return previewer
     except Exception as e:
-        print(f"[SaveIntermediates] Warning: Could not load TAESD previewer: {e}")
+        print(f"[SaveIntermediates] Warning: Could not load previewer: {e}")
         return None
 
 
@@ -32,11 +33,12 @@ class IntermediateStreamer:
     """Handles saving/streaming intermediate latents as images"""
 
     def __init__(self, output_dir: str, prefix: str, format: str, previewer,
-                 job_id: str = "", save_base64: bool = False, total_steps: int = 20):
+                 latent_format, job_id: str = "", save_base64: bool = False, total_steps: int = 20):
         self.output_dir = output_dir
         self.prefix = prefix
         self.format = format.lower()
         self.previewer = previewer
+        self.latent_format = latent_format
         self.job_id = job_id
         self.save_base64 = save_base64
         self.total_steps = total_steps
@@ -66,26 +68,34 @@ class IntermediateStreamer:
         except Exception as e:
             print(f"[SaveIntermediates] Error writing progress: {e}")
 
-    def save_step(self, denoised: torch.Tensor, step: int):
-        """Save a single step's denoised latent as an image"""
+    def save_step(self, latent: torch.Tensor, step: int):
+        """Save a single step's latent as an image"""
         try:
             if self.previewer is None:
+                print(f"[SaveIntermediates] No previewer available")
                 return None
 
             # Ensure proper shape: [B, C, H, W]
-            if denoised.dim() == 3:
-                denoised = denoised.unsqueeze(0)
-            elif denoised.dim() == 5:
+            if latent.dim() == 3:
+                latent = latent.unsqueeze(0)
+            elif latent.dim() == 5:
                 # Video latent [B, F, C, H, W] - take first frame
-                denoised = denoised[:, 0, :, :, :]
+                latent = latent[:, 0, :, :, :]
 
-            # Take first batch item only
-            latent = denoised[0:1].to(torch.float32)
+            # Take first batch item, ensure float32, keep on same device
+            latent_sample = latent[0:1].clone().to(torch.float32)
 
-            # Decode using TAESD
+            # Process through latent format if available
+            if self.latent_format is not None:
+                try:
+                    latent_sample = self.latent_format.process_out(latent_sample)
+                except:
+                    pass
+
+            # Decode using previewer
             preview_result = self.previewer.decode_latent_to_preview_image(
                 "JPEG" if self.format == "jpeg" else "PNG",
-                latent
+                latent_sample
             )
 
             if preview_result and len(preview_result) > 1:
@@ -106,7 +116,6 @@ class IntermediateStreamer:
 
                 self.step_count += 1
                 self._update_progress(step, filename, "generating", base64_data)
-
                 return filepath
 
         except Exception as e:
@@ -122,7 +131,7 @@ class IntermediateStreamer:
 class SaveIntermediateSteps:
     """
     Saves intermediate sampling steps for streaming to frontend.
-    Uses ComfyUI's callback system to get properly denoised latents.
+    Works with Flux, SD3.5, SDXL, SD1.5, etc.
     """
 
     @classmethod
@@ -156,13 +165,15 @@ class SaveIntermediateSteps:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             full_output_dir = os.path.join(base_output, output_folder, timestamp)
 
-        previewer = get_taesd_decoder(model.model.latent_format)
+        previewer = get_previewer(model)
+        latent_format = model.model.latent_format if hasattr(model.model, 'latent_format') else None
 
         streamer = IntermediateStreamer(
             output_dir=full_output_dir,
             prefix=filename_prefix,
             format=format,
             previewer=previewer,
+            latent_format=latent_format,
             job_id=job_id,
             save_base64=include_base64,
             total_steps=steps
@@ -171,8 +182,9 @@ class SaveIntermediateSteps:
         # Clone model
         wrapped_model = model.clone()
 
-        # Store model sampling info for denoising calculation
+        # Check model type
         model_sampling = wrapped_model.model.model_sampling if hasattr(wrapped_model.model, 'model_sampling') else None
+        is_flow_model = hasattr(model_sampling, 'calculate_denoised') if model_sampling else False
 
         # Get original apply_model
         original_apply_model = wrapped_model.model.apply_model
@@ -183,32 +195,38 @@ class SaveIntermediateSteps:
             model_output = original_apply_model(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
 
             try:
-                # Calculate denoised (x0) from model output
-                # For most models: x0 = x - sigma * eps (for eps prediction)
-                # Or for v-prediction: x0 = sigma * x - ... (more complex)
-
-                if model_sampling is not None:
+                # Calculate denoised based on model type
+                if model_sampling is not None and is_flow_model:
+                    # For Flux/Flow models - use the model's own denoising calculation
+                    try:
+                        sigma = model_sampling.sigma(t)
+                        denoised = model_sampling.calculate_denoised(sigma, model_output, x)
+                    except:
+                        # Fallback for flow matching: denoised = x - (1-sigma) * v
+                        sigma = model_sampling.sigma(t)
+                        if sigma.dim() == 0:
+                            sigma = sigma.unsqueeze(0)
+                        while sigma.dim() < x.dim():
+                            sigma = sigma.unsqueeze(-1)
+                        # For rectified flow: x0 = x - sigma * v
+                        denoised = x - sigma * model_output
+                elif model_sampling is not None:
+                    # For eps-prediction models (SD1.5, SDXL, etc.)
                     sigma = model_sampling.sigma(t)
                     if sigma.dim() == 0:
                         sigma = sigma.unsqueeze(0)
-
-                    # Reshape sigma for broadcasting [B, 1, 1, 1]
                     while sigma.dim() < x.dim():
                         sigma = sigma.unsqueeze(-1)
-
-                    # Calculate denoised estimate
-                    # This assumes eps-prediction: x0 = x - sigma * eps
-                    # For v-prediction models this won't be perfect but still shows progress
+                    # x0 = x - sigma * eps
                     denoised = x - sigma * model_output
                 else:
-                    # Fallback: just use input x as rough estimate
+                    # Fallback: use x directly
                     denoised = x
 
-                # Make sure it's the right shape [B, C, H, W]
+                # Save the preview
                 if denoised.dim() == 4:
                     streamer.save_step(denoised, step_counter[0])
                 elif denoised.dim() == 5:
-                    # Video: save first frame
                     streamer.save_step(denoised[:, 0], step_counter[0])
 
                 step_counter[0] += 1
@@ -224,6 +242,7 @@ class SaveIntermediateSteps:
 
         print(f"[SaveIntermediates] Streaming to: {full_output_dir}")
         print(f"[SaveIntermediates] Poll progress at: {full_output_dir}/progress.json")
+        print(f"[SaveIntermediates] Flow model detected: {is_flow_model}")
 
         return (wrapped_model,)
 
@@ -269,13 +288,15 @@ class SaveIntermediateStepsAdvanced:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             full_output_dir = os.path.join(base_output, output_folder, timestamp)
 
-        previewer = get_taesd_decoder(model.model.latent_format)
+        previewer = get_previewer(model)
+        latent_format = model.model.latent_format if hasattr(model.model, 'latent_format') else None
 
         streamer = IntermediateStreamer(
             output_dir=full_output_dir,
             prefix=filename_prefix,
             format=format,
             previewer=previewer,
+            latent_format=latent_format,
             job_id=job_id,
             save_base64=include_base64,
             total_steps=steps
@@ -283,6 +304,7 @@ class SaveIntermediateStepsAdvanced:
 
         wrapped_model = model.clone()
         model_sampling = wrapped_model.model.model_sampling if hasattr(wrapped_model.model, 'model_sampling') else None
+        is_flow_model = hasattr(model_sampling, 'calculate_denoised') if model_sampling else False
         original_apply_model = wrapped_model.model.apply_model
         step_counter = [0]
 
@@ -298,7 +320,18 @@ class SaveIntermediateStepsAdvanced:
 
             if should_save:
                 try:
-                    if model_sampling is not None:
+                    if model_sampling is not None and is_flow_model:
+                        try:
+                            sigma = model_sampling.sigma(t)
+                            denoised = model_sampling.calculate_denoised(sigma, model_output, x)
+                        except:
+                            sigma = model_sampling.sigma(t)
+                            if sigma.dim() == 0:
+                                sigma = sigma.unsqueeze(0)
+                            while sigma.dim() < x.dim():
+                                sigma = sigma.unsqueeze(-1)
+                            denoised = x - sigma * model_output
+                    elif model_sampling is not None:
                         sigma = model_sampling.sigma(t)
                         if sigma.dim() == 0:
                             sigma = sigma.unsqueeze(0)
